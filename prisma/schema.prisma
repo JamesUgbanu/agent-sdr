@@ -1,0 +1,665 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// ── Identity / tenancy ──
+model User {
+  id        String   @id @default(cuid())
+  email     String   @unique
+  name      String?
+  passwordHash String?
+  createdAt DateTime @default(now())
+  memberships CampaignMember[]
+  workspaces WorkspaceMember[]
+}
+
+model Workspace {
+  id        String   @id @default(cuid())
+  name      String
+  createdAt DateTime @default(now())
+  members   WorkspaceMember[]
+  campaigns Campaign[]
+  companies Company[]
+  contacts  Contact[]
+  leads     Lead[]
+  crmConnections CrmConnection[]
+  calendarConnections CalendarConnection[]
+  emailConnections EmailConnection[]
+  channelConnections ChannelConnection[]
+  prompts Prompt[]
+  modelConfigs ModelConfig[]
+  suppression Suppression[]
+}
+
+model WorkspaceMember {
+  id String @id @default(cuid())
+  workspaceId String
+  userId String
+  role String @default("member") // owner|admin|member
+  workspace Workspace @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+  @@unique([workspaceId, userId])
+}
+
+// ── Campaigns ──
+model Campaign {
+  id String @id @default(cuid())
+  workspaceId String
+  workspace Workspace @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+  name String
+  description String?
+  status String @default("draft") // draft|active|paused|archived
+  targetGeography String?
+  targetIndustries String[] @default([])
+  companySizeMin Int?
+  companySizeMax Int?
+  jobTitles String[] @default([])
+  technologies String[] @default([])
+  revenueRange String?
+  fundingStage String?
+  intentCriteria String?
+  offer String?
+  valueProposition String?
+  senderName String?
+  channels String[] @default(["email"])
+  approvalPolicy String @default("assisted") // manual|assisted|autonomous
+  approvalConfidenceThreshold Float @default(0.8)
+  dailySendLimit Int @default(50)
+  timezone String @default("UTC")
+  workingHoursStart String @default("09:00")
+  workingHoursEnd String @default("17:00")
+  followUpRules Json?
+  scoringWeights Json? // {companyFit,roleFit,geo,intent,signal,dataConfidence}
+  minScoreToContact Int @default(60)
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+  members CampaignMember[]
+  icpProfiles IcpProfile[]
+  sequences Sequence[]
+  leads Lead[]
+  @@index([workspaceId, status])
+}
+
+model CampaignMember {
+  id String @id @default(cuid())
+  campaignId String
+  userId String
+  role String @default("owner")
+  campaign Campaign @relation(fields: [campaignId], references: [id], onDelete: Cascade)
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+}
+
+model IcpProfile {
+  id String @id @default(cuid())
+  campaignId String
+  campaign Campaign @relation(fields: [campaignId], references: [id], onDelete: Cascade)
+  criteria Json // executable criteria snapshot
+  createdAt DateTime @default(now())
+}
+
+// ── Prospect graph ──
+model Company {
+  id String @id @default(cuid())
+  workspaceId String
+  workspace Workspace @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+  name String
+  domain String?
+  industry String?
+  employeeCount Int?
+  location String?
+  technologies String[] @default([])
+  description String?
+  funding String?
+  website String?
+  linkedinUrl String?
+  enrichmentConfidence String @default("unknown")
+  enrichmentRaw Json?
+  dedupeKey String?
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+  contacts Contact[]
+  leads Lead[]
+  @@unique([workspaceId, domain])
+  @@index([workspaceId, name])
+}
+
+model Contact {
+  id String @id @default(cuid())
+  workspaceId String
+  workspace Workspace @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+  companyId String?
+  company Company? @relation(fields: [companyId], references: [id], onDelete: SetNull)
+  firstName String?
+  lastName String?
+  fullName String?
+  title String?
+  email String?
+  emailConfidence String @default("unknown") // verified|high|medium|low|unknown
+  linkedinUrl String?
+  location String?
+  role String?
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+  leads Lead[]
+  @@index([workspaceId, email])
+}
+
+model Lead {
+  id String @id @default(cuid())
+  workspaceId String
+  workspace Workspace @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+  campaignId String
+  campaign Campaign @relation(fields: [campaignId], references: [id], onDelete: Cascade)
+  companyId String?
+  company Company? @relation(fields: [companyId], references: [id], onDelete: SetNull)
+  contactId String?
+  contact Contact? @relation(fields: [contactId], references: [id], onDelete: SetNull)
+  status String @default("NEW")
+  score Int?
+  scoreBreakdown Json?
+  scoreReasoning String?
+  disqualifiedReason String?
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+  signals LeadSignal[]
+  research LeadResearch[]
+  scores LeadScore[]
+  sequenceState LeadSequenceState?
+  threads MessageThread[]
+  approvals Approval[]
+  tasks AgentTask[]
+  meetings Meeting[]
+  @@unique([campaignId, contactId])
+  @@index([campaignId, status])
+  @@index([workspaceId, status])
+}
+
+model LeadScore {
+  id String @id @default(cuid())
+  leadId String
+  lead Lead @relation(fields: [leadId], references: [id], onDelete: Cascade)
+  score Int
+  breakdown Json
+  reasoning String?
+  evidence Json?
+  createdAt DateTime @default(now())
+}
+
+model LeadSignal {
+  id String @id @default(cuid())
+  leadId String
+  lead Lead @relation(fields: [leadId], references: [id], onDelete: Cascade)
+  type String
+  strength Float @default(0.5)
+  source String?
+  evidence Json?
+  detectedAt DateTime @default(now())
+  expiresAt DateTime?
+  @@index([leadId, type])
+}
+
+model LeadResearch {
+  id String @id @default(cuid())
+  leadId String
+  lead Lead @relation(fields: [leadId], references: [id], onDelete: Cascade)
+  companySummary String?
+  signals Json?
+  painPointHypotheses String[] @default([])
+  relevantProducts String[] @default([])
+  evidence Json // [{source_url,source_type,retrieved_at,claim,confidence}]
+  createdAt DateTime @default(now())
+}
+
+// ── Sequences / messaging ──
+model Sequence {
+  id String @id @default(cuid())
+  campaignId String
+  campaign Campaign @relation(fields: [campaignId], references: [id], onDelete: Cascade)
+  name String
+  steps SequenceStep[]
+  createdAt DateTime @default(now())
+}
+
+model SequenceStep {
+  id String @id @default(cuid())
+  sequenceId String
+  sequence Sequence @relation(fields: [sequenceId], references: [id], onDelete: Cascade)
+  order Int
+  dayOffset Int @default(0)
+  subjectTemplate String?
+  bodyTemplate String?
+  channel String @default("email")
+  @@unique([sequenceId, order])
+}
+
+model LeadSequenceState {
+  id String @id @default(cuid())
+  leadId String @unique
+  lead Lead @relation(fields: [leadId], references: [id], onDelete: Cascade)
+  sequenceId String?
+  currentStep Int @default(0)
+  nextRunAt DateTime?
+  stoppedReason String?
+  idempotencyKeys String[] @default([])
+}
+
+model MessageThread {
+  id String @id @default(cuid())
+  leadId String
+  lead Lead @relation(fields: [leadId], references: [id], onDelete: Cascade)
+  subject String?
+  channel String @default("email")
+  externalThreadId String?
+  createdAt DateTime @default(now())
+  messages Message[]
+}
+
+model Message {
+  id String @id @default(cuid())
+  threadId String
+  thread MessageThread @relation(fields: [threadId], references: [id], onDelete: Cascade)
+  direction String // outbound|inbound
+  subject String?
+  body String
+  personalizationPoints String[] @default([])
+  evidenceUsed Json?
+  confidence Float?
+  status String @default("draft") // draft|pending_approval|approved|queued|sending|sent|delivered|bounced|failed|replied
+  providerMessageId String? @unique
+  idempotencyKey String? @unique
+  sequenceStep Int?
+  classification String?
+  classificationConfidence Float?
+  error String?
+  sentAt DateTime?
+  createdAt DateTime @default(now())
+  events MessageEvent[]
+}
+
+model MessageEvent {
+  id String @id @default(cuid())
+  messageId String
+  message Message @relation(fields: [messageId], references: [id], onDelete: Cascade)
+  type String
+  payload Json?
+  createdAt DateTime @default(now())
+}
+
+// ── Agent runtime ──
+model AgentRun {
+  id String @id @default(cuid())
+  campaignId String?
+  leadId String?
+  type String // prospecting|enrichment|research|scoring|personalization|outreach|reply|meeting|crm
+  status String @default("running") // running|completed|failed|needs_review
+  input Json?
+  output Json?
+  model String?
+  tokens Int @default(0)
+  costUsd Float @default(0)
+  latencyMs Int @default(0)
+  error String?
+  correlationId String?
+  createdAt DateTime @default(now())
+  steps AgentStep[]
+}
+
+model AgentStep {
+  id String @id @default(cuid())
+  runId String
+  run AgentRun @relation(fields: [runId], references: [id], onDelete: Cascade)
+  index Int
+  action String
+  detail Json?
+  createdAt DateTime @default(now())
+  toolCalls AgentToolCall[]
+}
+
+model AgentToolCall {
+  id String @id @default(cuid())
+  stepId String
+  step AgentStep @relation(fields: [stepId], references: [id], onDelete: Cascade)
+  tool String
+  args Json?
+  result Json?
+  status String @default("ok")
+  latencyMs Int @default(0)
+  createdAt DateTime @default(now())
+}
+
+model AgentEvent {
+  id String @id @default(cuid())
+  runId String?
+  campaignId String?
+  leadId String?
+  kind String
+  message String
+  payload Json?
+  createdAt DateTime @default(now())
+  @@index([leadId, createdAt])
+  @@index([campaignId, createdAt])
+}
+
+model Approval {
+  id String @id @default(cuid())
+  leadId String
+  lead Lead @relation(fields: [leadId], references: [id], onDelete: Cascade)
+  messageId String?
+  status String @default("pending") // pending|approved|rejected|auto_approved
+  reason String?
+  decidedBy String?
+  createdAt DateTime @default(now())
+  decidedAt DateTime?
+  @@index([leadId, status])
+}
+
+model AgentTask {
+  id String @id @default(cuid())
+  leadId String
+  lead Lead @relation(fields: [leadId], references: [id], onDelete: Cascade)
+  type String // review_reply|review_message|schedule_meeting|manual_note
+  status String @default("open") // open|done|cancelled
+  payload Json?
+  createdAt DateTime @default(now())
+}
+
+// ── Connections / calendar / meetings / CRM ──
+model EmailConnection {
+  id String @id @default(cuid())
+  workspaceId String
+  workspace Workspace @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+  provider String // resend|sendgrid|postmark|ses|smtp|console
+  fromEmail String
+  encryptedConfig String // encrypted JSON
+  createdAt DateTime @default(now())
+}
+
+model CrmConnection {
+  id String @id @default(cuid())
+  workspaceId String
+  workspace Workspace @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+  provider String // hubspot|salesforce|console
+  encryptedConfig String
+  createdAt DateTime @default(now())
+}
+
+model CalendarConnection {
+  id String @id @default(cuid())
+  workspaceId String
+  workspace Workspace @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+  provider String // google|outlook|calcom|console
+  encryptedConfig String
+  createdAt DateTime @default(now())
+}
+
+model ChannelConnection {
+  id String @id @default(cuid())
+  workspaceId String
+  workspace Workspace @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+  channel String // linkedin|sms|whatsapp
+  provider String
+  status String @default("disabled")
+  encryptedConfig String @default("")
+}
+
+model Meeting {
+  id String @id @default(cuid())
+  leadId String
+  lead Lead @relation(fields: [leadId], references: [id], onDelete: Cascade)
+  providerMeetingId String?
+  title String?
+  startsAt DateTime
+  endsAt DateTime
+  timezone String @default("UTC")
+  attendeeEmail String?
+  status String @default("scheduled")
+  createdAt DateTime @default(now())
+}
+
+model Suppression {
+  id String @id @default(cuid())
+  workspaceId String
+  workspace Workspace @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+  email String?
+  domain String?
+  reason String // unsubscribed|bounced|do_not_contact|not_interested
+  createdAt DateTime @default(now())
+  @@index([workspaceId, email])
+}
+
+// ── Prompts / models / observability / usage ──
+model Prompt {
+  id String @id @default(cuid())
+  workspaceId String?
+  workspace Workspace? @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+  key String // research-agent, personalization-agent, reply-classifier...
+  versions PromptVersion[]
+  @@unique([workspaceId, key])
+}
+
+model PromptVersion {
+  id String @id @default(cuid())
+  promptId String
+  prompt Prompt @relation(fields: [promptId], references: [id], onDelete: Cascade)
+  version Int
+  content String
+  model String?
+  temperature Float?
+  active Boolean @default(false)
+  createdAt DateTime @default(now())
+}
+
+model ModelConfig {
+  id String @id @default(cuid())
+  workspaceId String?
+  workspace Workspace? @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+  task String // research|scoring|personalization|reply|conversation|classification|enrichment
+  provider String // openai|anthropic|openrouter
+  model String
+  maxTokens Int @default(2000)
+  temperature Float @default(0.2)
+  enabled Boolean @default(true)
+  priority Int @default(0) // higher wins
+  fallbackModel String?
+  maxCostUsdPer1kTokens Float?
+  @@index([task, enabled, priority])
+}
+
+model ActivityLog {
+  id String @id @default(cuid())
+  workspaceId String?
+  campaignId String?
+  leadId String?
+  actor String // agent|user|system
+  action String
+  detail Json?
+  createdAt DateTime @default(now())
+  @@index([campaignId, createdAt])
+  @@index([leadId, createdAt])
+}
+
+model UsageEvent {
+  id String @id @default(cuid())
+  workspaceId String?
+  campaignId String?
+  leadId String?
+  kind String // llm_tokens|email_sent|enrichment_call|crm_sync
+  quantity Int @default(1)
+  costUsd Float @default(0)
+  meta Json?
+  createdAt DateTime @default(now())
+}
+
+// ── Knowledge store (workspace-scoped RAG playbook; no LangChain) ──
+model KnowledgeSource {
+  id String @id @default(cuid())
+  workspaceId String
+  name String // pricing|product|objections|playbook|approved-claims...
+  kind String // pricing|product|objection|faq|playbook|policy|other
+  documents KnowledgeDocument[]
+  createdAt DateTime @default(now())
+  @@unique([workspaceId, name])
+}
+
+model KnowledgeDocument {
+  id String @id @default(cuid())
+  sourceId String
+  source KnowledgeSource @relation(fields: [sourceId], references: [id], onDelete: Cascade)
+  title String
+  currentVersion Int @default(1)
+  chunks KnowledgeChunk[]
+  versions KnowledgeVersion[]
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+}
+
+model KnowledgeVersion {
+  id String @id @default(cuid())
+  documentId String
+  document KnowledgeDocument @relation(fields: [documentId], references: [id], onDelete: Cascade)
+  version Int
+  content String
+  createdBy String?
+  createdAt DateTime @default(now())
+  @@unique([documentId, version])
+}
+
+model KnowledgeChunk {
+  id String @id @default(cuid())
+  documentId String
+  document KnowledgeDocument @relation(fields: [documentId], references: [id], onDelete: Cascade)
+  version Int @default(1)
+  heading String?
+  content String
+  tokens Int @default(0)
+  // keyword index kept in plain text for portable FTS; vector column added when pgvector is available
+  keywords String[] @default([])
+  createdAt DateTime @default(now())
+  @@index([documentId, version])
+}
+
+// ── Conversational SDR state ──
+model Conversation {
+  id String @id @default(cuid())
+  workspaceId String
+  leadId String
+  status String @default("open") // open|handed_off|opted_out|resolved
+  intent String?
+  qualificationState String?
+  objections String[] @default([])
+  questions String[] @default([])
+  meetingIntent Boolean @default(false)
+  handoffReason String?
+  optedOut Boolean @default(false)
+  knowledgeContext Json?
+  model String?
+  promptVersion String?
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+  messages ConversationMessage[]
+  @@index([leadId, status])
+}
+
+model ConversationMessage {
+  id String @id @default(cuid())
+  conversationId String
+  conversation Conversation @relation(fields: [conversationId], references: [id], onDelete: Cascade)
+  role String // prospect|agent|human
+  body String
+  intent String?
+  knowledgeUsed Json?
+  createdAt DateTime @default(now())
+}
+
+// ── Research cache (workspace-scoped; never leaks across workspaces) ──
+model ResearchCache {
+  id String @id @default(cuid())
+  workspaceId String
+  subjectType String // company|person
+  subjectKey String // domain or email, lowercased
+  researchType String // website|signals|enrichment
+  version Int @default(1)
+  provider String?
+  sourceHash String?
+  payload Json
+  hits Int @default(0)
+  expiresAt DateTime
+  createdAt DateTime @default(now())
+  @@unique([workspaceId, subjectType, subjectKey, researchType, version])
+  @@index([workspaceId, expiresAt])
+}
+
+// ── Per-invocation LLM usage (nulls where provider exposes nothing; never invented) ──
+model LlmUsage {
+  id String @id @default(cuid())
+  workspaceId String?
+  campaignId String?
+  leadId String?
+  runId String?
+  provider String
+  model String
+  task String
+  promptVersion String?
+  inputTokens Int?
+  outputTokens Int?
+  totalTokens Int?
+  costUsd Float?
+  costEstimated Boolean @default(false)
+  latencyMs Int @default(0)
+  success Boolean @default(true)
+  error String?
+  createdAt DateTime @default(now())
+  @@index([workspaceId, createdAt])
+  @@index([runId])
+}
+
+// ── Email verification cache ──
+model EmailVerification {
+  id String @id @default(cuid())
+  workspaceId String
+  email String
+  status String // deliverable|risky|undeliverable|unknown|unavailable
+  confidence Float?
+  provider String?
+  evidence Json?
+  verifiedAt DateTime @default(now())
+  expiresAt DateTime
+  @@unique([workspaceId, email])
+}
+
+// ── CRM sync ledger (failures are persisted, never silently lost) ──
+model CrmSync {
+  id String @id @default(cuid())
+  workspaceId String
+  leadId String?
+  provider String
+  operation String // upsert_contact|add_note|create_deal|create_activity
+  externalId String?
+  status String @default("pending") // pending|ok|failed
+  attempts Int @default(0)
+  error String?
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+  @@index([leadId, operation])
+}
+
+// ── Dead-letter queue ──
+model DeadLetter {
+  id String @id @default(cuid())
+  queue String
+  payload Json
+  attempts Int @default(0)
+  lastError String?
+  provider String?
+  workspaceId String?
+  history Json?
+  status String @default("open") // open|retried|resolved|abandoned
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+  @@index([queue, status])
+}

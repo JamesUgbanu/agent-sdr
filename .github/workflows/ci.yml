@@ -1,0 +1,15 @@
+name: ci
+on: [push, pull_request]
+permissions:
+  contents: read
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with: { node-version: 22 }
+      - run: npm ci --no-audit --no-fund
+      - run: DATABASE_URL="postgresql://sdr:sdr@localhost:5432/sdr" npx prisma generate
+      - run: npm run typecheck
+      - run: npm test
