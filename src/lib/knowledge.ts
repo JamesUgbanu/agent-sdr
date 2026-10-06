@@ -1,8 +1,69 @@
 import { db, J } from "./db";
 
-// Workspace-scoped knowledge store. Portable keyword retrieval (no vector DB required);
-// a pgvector column can be added to knowledge_chunks later without changing this API.
-// Retrieval NEVER crosses workspace boundaries.
+// Workspace-scoped knowledge store with hybrid retrieval:
+// keyword (portable, always available) + pgvector cosine (when embeddings exist).
+// Retrieval NEVER crosses workspace boundaries. API unchanged from the
+// keyword-only era: callers get ranked chunks with evidence references.
+
+export const EMBEDDING_MODEL = "text-embedding-3-small";
+export const EMBEDDING_DIMS = 1536;
+const EMBED_WEIGHT = 1.0; // semantic contribution added to keyword score
+
+type EmbedFn = (texts: string[]) => Promise<number[][] | null>;
+let embedOverride: EmbedFn | null = null;
+// Test hook only: deterministic vectors without API keys.
+export function __setEmbedOverride(fn: EmbedFn | null) {
+  embedOverride = fn;
+}
+
+async function embedTexts(texts: string[]): Promise<number[][] | null> {
+  if (embedOverride) return embedOverride(texts);
+  const key = process.env.OPENAI_API_KEY;
+  if (!key || texts.length === 0) return null;
+  try {
+    const { default: OpenAI } = await import("openai");
+    const client = new OpenAI({ apiKey: key });
+    const r = await client.embeddings.create({ model: EMBEDDING_MODEL, input: texts });
+    const vecs = r.data.sort((a, b) => a.index - b.index).map((d) => d.embedding);
+    if (vecs.some((v) => v.length !== EMBEDDING_DIMS)) return null;
+    return vecs;
+  } catch {
+    return null; // embeddings unavailable → keyword-only retrieval
+  }
+}
+
+function toVectorLiteral(vec: number[]): string | null {
+  if (vec.length !== EMBEDDING_DIMS || vec.some((n) => !Number.isFinite(n))) return null;
+  return `[${vec.join(",")}]`;
+}
+
+async function storeChunkEmbeddings(chunkIds: string[], vectors: number[][]): Promise<void> {
+  for (let i = 0; i < chunkIds.length; i++) {
+    const lit = toVectorLiteral(vectors[i]!);
+    if (!lit) continue;
+    try {
+      await db.$executeRaw`UPDATE "KnowledgeChunk" SET embedding = ${lit}::vector, "embeddingModel" = ${EMBEDDING_MODEL}, "embeddedAt" = NOW() WHERE id = ${chunkIds[i]}`;
+    } catch { /* a single failed row must not break ingestion */ }
+  }
+}
+
+// Backfill embeddings for chunks created before embeddings were enabled (or
+// when the embedding model changes). Idempotent: only touches NULL rows.
+export async function backfillKnowledgeEmbeddings(workspaceId?: string, batchSize = 50): Promise<{ embedded: number; skipped: boolean }> {
+  const rows = await db.knowledgeChunk.findMany({
+    where: {
+      embeddingModel: null,
+      document: workspaceId ? { source: { workspaceId } } : undefined,
+    },
+    select: { id: true, content: true },
+    take: batchSize,
+  }).catch(() => []);
+  if (!rows.length) return { embedded: 0, skipped: false };
+  const vecs = await embedTexts(rows.map((r) => r.content));
+  if (!vecs) return { embedded: 0, skipped: true };
+  await storeChunkEmbeddings(rows.map((r) => r.id), vecs);
+  return { embedded: rows.length, skipped: false };
+}
 
 const STOP = new Set(
   "the,a,an,and,or,to,of,in,on,for,with,is,are,was,were,it,its,this,that,these,those,you,your,we,our,they,their,he,she,at,by,from,as,be,have,has,do,does,did,what,how,much,does,can,i,me,my".split(","),
@@ -62,21 +123,31 @@ export async function upsertKnowledgeDocument(opts: {
   // New version supersedes old chunks (old version retained in knowledge_versions for rollback).
   await db.knowledgeChunk.deleteMany({ where: { documentId: doc.id } });
   const parts = chunkText(opts.content);
+  const createdIds: string[] = [];
   for (const p of parts) {
-    await db.knowledgeChunk.create({
+    const row = await db.knowledgeChunk.create({
       data: {
         documentId: doc.id, version: doc.currentVersion, heading: p.heading,
         content: p.content, tokens: Math.ceil(p.content.length / 4),
         keywords: tokenize(p.content).slice(0, 60),
       },
     });
+    createdIds.push(row.id);
   }
+  // Best-effort semantic index (awaited so callers see a consistent index;
+  // failures leave keyword-only chunks behind — never fail ingestion).
+  try {
+    const vecs = await embedTexts(parts.map((p) => `${p.heading ?? ""}\n${p.content}`.slice(0, 8000)));
+    if (vecs) await storeChunkEmbeddings(createdIds, vecs);
+  } catch { /* keyword retrieval remains fully functional */ }
   return { documentId: doc.id, version: doc.currentVersion, chunks: parts.length };
 }
 
 export interface RetrievedChunk {
   chunkId: string; documentTitle: string; source: string;
   heading: string | null; content: string; score: number;
+  retrieval?: "keyword" | "vector" | "hybrid";
+  vectorSim?: number;
 }
 
 export async function retrieveKnowledge(
@@ -101,6 +172,7 @@ export async function retrieveKnowledge(
     take: 500,
   });
   const scored: RetrievedChunk[] = [];
+  const byId = new Map<string, RetrievedChunk & { kw: number }>();
   for (const c of chunks) {
     const kw = new Set(c.keywords);
     let hit = 0;
@@ -111,12 +183,60 @@ export async function retrieveKnowledge(
     const priceDoc = c.document.source.kind === "pricing" || c.document.source.name === "pricing";
     const finalScore = score + (priceQ && priceDoc ? 0.15 : 0);
     if (finalScore >= minScore) {
-      scored.push({
+      const row: RetrievedChunk & { kw: number } = {
         chunkId: c.id, documentTitle: c.document.title, source: c.document.source.name,
         heading: c.heading, content: c.content, score: Math.round(finalScore * 100) / 100,
-      });
+        retrieval: "keyword", kw: finalScore,
+      };
+      scored.push(row);
+      byId.set(c.id, row);
     }
   }
+
+  // Vector leg: cosine similarity over pgvector, merged additively. Any
+  // failure (no key, no extension, no vectors) degrades to keyword-only.
+  try {
+    const qvecs = await embedTexts([query]);
+    const qlit = qvecs?.[0] ? toVectorLiteral(qvecs[0]) : null;
+    if (qlit) {
+      const rows = await db.$queryRaw<Array<{ id: string; sim: number }>>`
+        SELECT kc.id, 1 - (kc.embedding <=> ${qlit}::vector) AS sim
+        FROM "KnowledgeChunk" kc
+        JOIN "KnowledgeDocument" kd ON kd.id = kc."documentId"
+        JOIN "KnowledgeSource" ks ON ks.id = kd."sourceId"
+        WHERE ks."workspaceId" = ${workspaceId} AND kc.embedding IS NOT NULL
+        ORDER BY kc.embedding <=> ${qlit}::vector
+        LIMIT ${Math.max(topK * 3, 10)}`;
+      const kinds = opts?.kinds?.length ? new Set(opts.kinds) : null;
+      const byChunkId = new Map(chunks.map((c) => [c.id, c]));
+      for (const r of rows) {
+        const c = byChunkId.get(r.id);
+        if (!c) continue;
+        if (kinds && !kinds.has(c.document.source.kind)) continue;
+        const sim = Math.round(r.sim * 100) / 100;
+        const existing = byId.get(r.id);
+        if (existing) {
+          existing.score = Math.round((existing.kw + sim * EMBED_WEIGHT) * 100) / 100;
+          existing.retrieval = "hybrid";
+          existing.vectorSim = sim;
+        } else if (sim * EMBED_WEIGHT >= minScore * 0.5) {
+          // Semantic-only hit: no keyword overlap, but clearly relevant.
+          // Admitted at half the keyword threshold to preserve recall for
+          // paraphrases while keeping the bar above noise.
+          const row: RetrievedChunk & { kw: number } = {
+            chunkId: c.id, documentTitle: c.document.title, source: c.document.source.name,
+            heading: c.heading, content: c.content,
+            score: Math.round(sim * EMBED_WEIGHT * 100) / 100,
+            retrieval: "vector", vectorSim: sim, kw: 0,
+          };
+          scored.push(row);
+          byId.set(r.id, row);
+        }
+      }
+    }
+  } catch { /* vector leg optional — keyword results stand */ }
+
+  for (const s of scored) delete (s as Partial<{ kw: number }>).kw;
   return scored.sort((a, b) => b.score - a.score).slice(0, topK);
 }
 

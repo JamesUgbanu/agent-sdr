@@ -17,8 +17,8 @@ export default function LoginPage() {
     <div style={{ maxWidth: 360 }}>
       <h1>Sign in</h1>
       <form onSubmit={submit} style={{ display: "grid", gap: 8 }}>
-        <input placeholder="Email" value={email} onChange={(e) => setEmail(e.target.value)} style={i} />
-        <input placeholder="Password (min 10 chars)" type="password" value={password} onChange={(e) => setPassword(e.target.value)} style={i} />
+        <input aria-label="Email" placeholder="Email" value={email} onChange={(e) => setEmail(e.target.value)} style={i} />
+        <input aria-label="Password" placeholder="Password (min 10 chars)" type="password" value={password} onChange={(e) => setPassword(e.target.value)} style={i} />
         {error && <div style={{ color: "#ff8080" }}>{error}</div>}
         <button style={b}>Sign in</button>
       </form>

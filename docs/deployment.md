@@ -23,6 +23,20 @@ Native (non-Docker) alternative: `docker compose up -d postgres redis`, then
 and `npm run worker` in a second process. Terraform in `infra/terraform/` provisions
 AWS RDS + ElastiCache + secrets + log group for cloud deploys.
 
+## Per-client deployments (one client = one isolated stack)
+```bash
+./deploy-client.sh acme --app-port 3001 --pg-port 5434 --redis-port 6380 --no-seed-demo
+```
+This generates `.env.acme` (with real secrets — never committed), starts a dedicated
+Compose project (`agent-sdr-acme`), runs migrations and seed, waits for all health
+checks, and verifies app/worker/database/Redis. It fails fast if
+`EMAIL_WEBHOOK_SECRET` or the auth/encryption secrets are missing or placeholders.
+Re-running is safe (idempotent; volumes are never dropped). Validate config any time:
+```bash
+npx tsx scripts/check-config.ts            # warnings OK locally
+NODE_ENV=production npx tsx scripts/check-config.ts --strict   # what prod boot enforces
+```
+
 ## Auth
 Auth.js credentials provider, JWT sessions, scrypt-hashed passwords. First user signs up
 at `/signup` (gets a personal workspace as owner), then signs in at `/login`.
@@ -32,6 +46,9 @@ Set `SIGNUP_ENABLED=false` after creating admin users. API routes enforce
 ## Webhooks
 Point the email provider at `POST /api/webhooks/email` with header
 `x-webhook-secret: $EMAIL_WEBHOOK_SECRET`. Handler validates → persists → enqueues → 200.
+In production the secret is mandatory: requests without a valid signature are
+rejected with 401 and audit-logged. Delivery-event webhooks additionally accept
+optional Svix verification via `RESEND_WEBHOOK_SECRET`.
 
 ## Troubleshooting
 - `Can't reach database server` / `Cannot connect to the Docker daemon`: start Docker Desktop

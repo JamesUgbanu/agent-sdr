@@ -5,11 +5,8 @@ import { withApi } from "@/lib/api";
 
 // Inbound email webhook: validate → persist → queue. Never run the agent inline.
 async function postHandler(req: Request) {
-  const { safeEqual } = await import("@/lib/crypto");
-  const secret = req.headers.get("x-webhook-secret");
-  if (process.env.EMAIL_WEBHOOK_SECRET && !safeEqual(secret, process.env.EMAIL_WEBHOOK_SECRET)) {
-    return NextResponse.json({ error: "unauthorized" }, { status: 401 });
-  }
+  const { webhookAuth } = await import("@/lib/webhook-auth");
+  await webhookAuth(req, "email-inbound");
   // Payload size guard: inbound email bodies have no business exceeding 256KB.
   const claimed = Number(req.headers.get("content-length") ?? 0);
   if (claimed > 262_144) return NextResponse.json({ error: "payload too large" }, { status: 413 });

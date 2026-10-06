@@ -23,9 +23,9 @@ export default function SignupPage() {
     <div style={{ maxWidth: 360 }}>
       <h1>Sign up</h1>
       <form onSubmit={submit} style={{ display: "grid", gap: 8 }}>
-        <input placeholder="Name" value={name} onChange={(e) => setName(e.target.value)} style={i} />
-        <input placeholder="Email" value={email} onChange={(e) => setEmail(e.target.value)} style={i} />
-        <input placeholder="Password (min 10 chars)" type="password" value={password} onChange={(e) => setPassword(e.target.value)} style={i} />
+        <input aria-label="Name" placeholder="Name" value={name} onChange={(e) => setName(e.target.value)} style={i} />
+        <input aria-label="Email" placeholder="Email" value={email} onChange={(e) => setEmail(e.target.value)} style={i} />
+        <input aria-label="Password" placeholder="Password (min 10 chars)" type="password" value={password} onChange={(e) => setPassword(e.target.value)} style={i} />
         <button style={b}>Create account</button>
       </form>
       {msg && <p style={{ color: "#ff8080" }}>{msg}</p>}

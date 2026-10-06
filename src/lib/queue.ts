@@ -99,13 +99,21 @@ export async function enqueue(name: string, payload: unknown, opts?: EnqueueOpts
       if (r) {
         const msg = JSON.stringify({ payload: body, attempt: 1, maxAttempts, workspaceId: opts?.workspaceId });
         if (opts?.delayMs) {
-          await r.zadd(`sdr:delayed:${name}`, Date.now() + opts.delayMs, msg).catch(() => undefined);
+          await r.zadd(`sdr:delayed:${name}`, Date.now() + opts.delayMs, msg);
         } else {
-          await r.lpush(`sdr:queue:${name}`, msg).catch(() => undefined);
+          await r.lpush(`sdr:queue:${name}`, msg);
         }
         return;
       }
-    } catch { /* fall through to inline */ }
+    } catch {
+      // Redis write failed: drop the stale client so the next call reconnects,
+      // then fall through to inline dispatch below. A job is never silently lost.
+      try {
+        const stale = sharedRedis as unknown as { disconnect?: () => void } | null;
+        stale?.disconnect?.();
+      } catch { /* ignore */ }
+      sharedRedis = null;
+    }
   }
   const run = () => dispatch(name, body, 1, maxAttempts, opts?.workspaceId).catch(() => undefined);
   if (opts?.delayMs) setTimeout(run, Math.min(opts.delayMs, 2_147_483_647));

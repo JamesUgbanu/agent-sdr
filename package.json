@@ -13,6 +13,7 @@
     "test": "vitest run",
     "test:watch": "vitest",
     "eval": "tsx eval/run.ts",
+    "check-config": "tsx scripts/check-config.ts",
     "db:migrate": "prisma migrate dev",
     "db:push": "prisma db push",
     "db:seed": "tsx prisma/seed.ts",

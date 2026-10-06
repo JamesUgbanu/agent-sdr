@@ -2,6 +2,7 @@ import { auth } from "@/auth";
 import { db } from "@/lib/db";
 import { requireWorkspaces } from "@/lib/session";
 import { redirect } from "next/navigation";
+import { EmptyState } from "../ui";
 
 export const dynamic = "force-dynamic";
 
@@ -19,8 +20,15 @@ export default async function Campaigns() {
   return (
     <div>
       <h1>Campaigns</h1>
-      {campaigns.length === 0 && <p style={{ color: "#9fb0c3" }}>No campaigns yet — POST /api/campaigns.</p>}
-      <ul>{campaigns.map((c) => <li key={c.id}><a href={`/campaigns/${c.id}`} style={{ color: "#7ea4ff" }}>{c.name}</a> — {c.status}</li>)}</ul>
+      {campaigns.length === 0 ? (
+        <EmptyState
+          title="No campaigns yet"
+          body="Create your first campaign to start finding and qualifying prospects. Define who you're targeting, and the agent handles discovery, research, outreach, and follow-ups."
+          action={<a href="/onboarding" style={{ color: "#7ea4ff" }}>Set up a campaign in onboarding →</a>}
+        />
+      ) : (
+        <ul>{campaigns.map((c) => <li key={c.id}><a href={`/campaigns/${c.id}`} style={{ color: "#7ea4ff" }}>{c.name}</a> — {c.status}</li>)}</ul>
+      )}
     </div>
   );
 }

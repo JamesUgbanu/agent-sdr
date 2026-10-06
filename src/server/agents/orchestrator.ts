@@ -3,7 +3,7 @@ import { db, J } from "@/lib/db";
 import { enqueue } from "@/lib/queue";
 import { scoreLead, WeightsSchema } from "@/lib/scoring";
 import { canContactLead, assertNoFabrication } from "@/lib/policy";
-import { transitionLead, canTransition } from "@/lib/state-machine";
+import { transitionLead, canTransition, setLeadStatus } from "@/lib/state-machine";
 import { getLLMProvider } from "@/lib/llm";
 import { resolveModel } from "@/lib/models";
 import { verifyEmailCached, updateCRM, calendarForWorkspace, bookMeeting, cancelBookedMeeting } from "@/lib/integrations";
@@ -68,7 +68,7 @@ export const tools: Record<string, { schema: z.ZodTypeAny; fn: ToolFn; destructi
           await db.lead.upsert({
             where: { campaignId_contactId: { campaignId: campaign.id, contactId: contact.id } },
             update: {},
-            create: { workspaceId: campaign.workspaceId, campaignId: campaign.id, companyId: company.id, contactId: contact.id, status: "NEW" },
+            create: { workspaceId: campaign.workspaceId, campaignId: campaign.id, companyId: company.id, contactId: contact.id, status: "NEW", source: provider.name },
           });
           if (!existingContact) {
             created++;
@@ -97,7 +97,11 @@ export const tools: Record<string, { schema: z.ZodTypeAny; fn: ToolFn; destructi
         }
       }
       if (domain && !cacheHit) {
-        try {
+        // SSRF guard: the domain comes from workspace-supplied company data.
+        const { isPublicHostname } = await import("@/lib/ssrf-guard");
+        if (!(await isPublicHostname(domain).catch(() => false))) {
+          await emit("research.blocked", `Skipped fetch for non-public domain: ${domain}`, { leadId: lead.id, campaignId: lead.campaignId });
+        } else try {
           const ctrl = new AbortController();
           const t = setTimeout(() => ctrl.abort(), 8000);
           const res = await fetch(`https://${domain}`, { signal: ctrl.signal, redirect: "follow" }).catch(() => null);
@@ -130,7 +134,7 @@ export const tools: Record<string, { schema: z.ZodTypeAny; fn: ToolFn; destructi
         // of a CONTACTED lead must not move it back to RESEARCHING).
         const cur = await db.lead.findUnique({ where: { id: lead.id } }).catch(() => null);
         if (cur && canTransition(cur.status, "RESEARCHING")) {
-          await db.lead.update({ where: { id: lead.id }, data: { status: "RESEARCHING" } });
+          await setLeadStatus(lead.id, "RESEARCHING", { note: "research complete" });
         }
       });
       await emit("research.completed", `Researched ${lead.company.name}: ${evidence.length} evidence items`, { leadId: lead.id, campaignId: lead.campaignId });
@@ -158,7 +162,8 @@ export const tools: Record<string, { schema: z.ZodTypeAny; fn: ToolFn; destructi
       // Never regress post-outreach states: re-scoring a CONTACTED/replied lead
       // records the score but leaves the conversation state untouched.
       const preOutreach = ["NEW", "RESEARCHING", "QUALIFIED", "READY_FOR_OUTREACH"].includes(lead.status);
-      await db.lead.update({ where: { id: lead.id }, data: { score, scoreBreakdown: J(factors), scoreReasoning: `score=${score}`, ...(preOutreach ? { status: next } : {}) } });
+      await db.lead.update({ where: { id: lead.id }, data: { score, scoreBreakdown: J(factors), scoreReasoning: `score=${score}` } });
+      if (preOutreach) await setLeadStatus(lead.id, next, { score });
       await emit("lead.scored", `Scored ${score}: ${JSON.stringify(factors)}`, { leadId: lead.id, campaignId: lead.campaignId });
       if (next === "READY_FOR_OUTREACH") await enqueue("personalization", { leadId: lead.id });
       return { score, factors };
@@ -204,12 +209,21 @@ export const tools: Record<string, { schema: z.ZodTypeAny; fn: ToolFn; destructi
         create: { id: `${lead.id}-main`, leadId: lead.id, subject: draft.subject, channel: "email" },
       }).catch(() => db.messageThread.create({ data: { leadId: lead.id, subject: draft.subject, channel: "email" } }));
       const gate = lead.campaign.approvalPolicy === "autonomous" || (lead.campaign.approvalPolicy === "assisted" && draft.confidence >= lead.campaign.approvalConfidenceThreshold);
+      // Deliverability enforcement: a FAIL preflight downgrades autonomous
+      // auto-approval to human review. Never silently sends on broken plumbing.
+      let blockedReason: string | null = null;
+      if (gate && lead.campaign.approvalPolicy === "autonomous") {
+        const { latestPreflightVerdict } = await import("@/lib/deliverability");
+        if ((await latestPreflightVerdict(lead.workspaceId).catch(() => null)) === "FAIL") {
+          blockedReason = "deliverability preflight FAIL — autonomous sending blocked until resolved";
+        }
+      }
       const message = await db.message.create({
         data: {
           threadId: thread.id, direction: "outbound", subject: draft.subject, body: draft.body,
           personalizationPoints: draft.personalization_points,
           evidenceUsed: J(research?.evidence ?? {}),
-          confidence: draft.confidence, status: gate ? "approved" : "pending_approval",
+          confidence: draft.confidence, status: gate && !blockedReason ? "approved" : "pending_approval",
           idempotencyKey: idemKey, sequenceStep: step as number,
         },
       }).catch(async (e) => {
@@ -220,8 +234,8 @@ export const tools: Record<string, { schema: z.ZodTypeAny; fn: ToolFn; destructi
         }
         throw e;
       });
-      if (!gate) {
-        await db.approval.create({ data: { leadId: lead.id, messageId: message.id, status: "pending", reason: `confidence ${draft.confidence} < threshold` } });
+      if (!gate || blockedReason) {
+        await db.approval.create({ data: { leadId: lead.id, messageId: message.id, status: "pending", reason: blockedReason ?? `confidence ${draft.confidence} < threshold` } });
         await emit("approval.requested", "Message awaiting human approval", { leadId: lead.id, campaignId: lead.campaignId });
       } else {
         await db.approval.create({ data: { leadId: lead.id, messageId: message.id, status: "auto_approved", reason: "policy gate passed" } });
@@ -240,6 +254,10 @@ export const tools: Record<string, { schema: z.ZodTypeAny; fn: ToolFn; destructi
       const lead = msg.thread.lead;
       const gate = await canContactLead(lead.id);
       if (!gate.ok) throw new Error(`Send blocked: ${gate.reason}`);
+      // Outreach is only valid once the lead has entered the sequence.
+      if (!["READY_FOR_OUTREACH", "CONTACTED", "FOLLOW_UP"].includes(lead.status)) {
+        throw new Error(`Send blocked: lead is ${lead.status}, not in an outreach state`);
+      }
       // Idempotency: exact step already sent?
       const dup = await db.message.findFirst({ where: { providerMessageId: { not: null }, thread: { leadId: lead.id }, sequenceStep: msg.sequenceStep, status: { in: ["sent", "delivered"] } } });
       if (dup) return { skipped: true, reason: "already-sent", providerMessageId: dup.providerMessageId };
@@ -273,7 +291,7 @@ export const tools: Record<string, { schema: z.ZodTypeAny; fn: ToolFn; destructi
           undefined, ws?.name, ws?.channel,
         );
         await db.message.update({ where: { id: msg.id }, data: { status: "sent", providerMessageId: res.providerMessageId, sentAt: new Date() } });
-        await db.lead.update({ where: { id: lead.id }, data: { status: lead.status === "READY_FOR_OUTREACH" ? "CONTACTED" : "FOLLOW_UP" } });
+        await setLeadStatus(lead.id, lead.status === "READY_FOR_OUTREACH" ? "CONTACTED" : "FOLLOW_UP", { messageId: msg.id });
         // Schedule next sequence step
         const seq = await db.sequence.findFirst({ where: { campaignId: lead.campaignId }, include: { steps: { orderBy: { order: "asc" } } } });
         const nextIdx = (msg.sequenceStep ?? 0) + 1;
@@ -291,6 +309,8 @@ export const tools: Record<string, { schema: z.ZodTypeAny; fn: ToolFn; destructi
       } catch (e) {
         // Do NOT blindly retry non-idempotent send: reconcile first.
         await db.message.update({ where: { id: msg.id }, data: { status: "failed", error: String(e) } });
+        const { evaluateOperationalAlerts } = await import("@/lib/deliverability");
+        await evaluateOperationalAlerts({ workspaceId: lead.workspaceId, leadId: lead.id, trigger: "send_failure" });
         throw e;
       }
     },
@@ -340,13 +360,13 @@ export const tools: Record<string, { schema: z.ZodTypeAny; fn: ToolFn; destructi
             update: {}, create: { id: `${lead.workspaceId}-${lead.contact.email}`, workspaceId: lead.workspaceId, email: lead.contact.email.toLowerCase(), reason: "unsubscribed" },
           }).catch(() => db.suppression.create({ data: { workspaceId: lead!.workspaceId, email: lead!.contact!.email!.toLowerCase(), reason: "unsubscribed" } }));
         }
-        await db.lead.update({ where: { id: leadId }, data: { status: "UNSUBSCRIBED" } });
+        await setLeadStatus(leadId, "UNSUBSCRIBED", { classification });
         await db.leadSequenceState.update({ where: { leadId }, data: { stoppedReason: "unsubscribed" } }).catch(() => undefined);
       } else if (classification === "not_interested") {
-        await db.lead.update({ where: { id: leadId }, data: { status: "NOT_INTERESTED" } });
+        await setLeadStatus(leadId, "NOT_INTERESTED", { classification });
         await db.leadSequenceState.update({ where: { leadId }, data: { stoppedReason: "not-interested" } }).catch(() => undefined);
       } else if (classification === "interested" || classification === "meeting_request") {
-        await db.lead.update({ where: { id: leadId }, data: { status: "MEETING_REQUESTED" } });
+        await setLeadStatus(leadId, "MEETING_REQUESTED", { classification });
         await db.leadSequenceState.update({ where: { leadId }, data: { stoppedReason: "replied-positive" } }).catch(() => undefined);
         await enqueue("meeting", { leadId });
       } else if (requiresHuman) {
@@ -371,8 +391,22 @@ export const tools: Record<string, { schema: z.ZodTypeAny; fn: ToolFn; destructi
           await enqueue("conversation", { leadId, prospectMessage: msg.body.slice(0, 2000) });
         }
       } else {
-        await db.lead.update({ where: { id: leadId }, data: { status: "REPLIED" } });
+        // Non-terminal reply (question, OOO, referral...): record the reply and
+        // stop the sequence, but never overwrite a further-advanced state
+        // (e.g. MEETING_REQUESTED from an earlier message in the thread).
+        try {
+          await setLeadStatus(leadId, "REPLIED", { classification });
+        } catch (e) {
+          // Already past REPLIED (e.g. MEETING_REQUESTED): keep the more
+          // advanced state. Anything else is a real failure — surface it.
+          if (!String(e).startsWith("Illegal transition")) throw e;
+        }
         await db.leadSequenceState.update({ where: { leadId }, data: { stoppedReason: "replied" } }).catch(() => undefined);
+        if (["question", "pricing_question", "objection"].includes(classification)) {
+          // High-confidence questions still deserve an answer: draft a
+          // knowledge-grounded response into the approval queue.
+          await enqueue("conversation", { leadId, prospectMessage: msg.body.slice(0, 2000) });
+        }
       }
       await emit("reply.classified", `${classification} (${confidence})`, { leadId, campaignId: msg.thread.lead.campaignId });
       return { classification, confidence, requiresHuman };
@@ -815,15 +849,20 @@ export async function runAgent(
       const snap = await buildSnapshot(type, ids, history, iter);
       let decision: ToolChoice;
       try {
-        decision = opts?.decide
-          ? await opts.decide(snap, allowed)
-          : await decideNextAction(snap, allowed, { workspaceId: snap.lead?.workspaceId, campaignId: ids.campaignId, leadId: ids.leadId, runId: run?.id });
+        const { withToolTimeout } = await import("@/lib/tool-timeout");
+        const decide =
+          opts?.decide ??
+          ((snap: StateSnapshot, allowed: string[]) =>
+            decideNextAction(snap, allowed, { workspaceId: snap.lead?.workspaceId, campaignId: ids.campaignId, leadId: ids.leadId, runId: run?.id }));
+        decision = await withToolTimeout("decideNextAction", () => decide(snap, allowed));
       } catch (e) {
         if (e instanceof DecisionError && !opts?.decide) {
           // Genuine recovery: give the model its validation error and one chance
           // to correct. A second failure escalates — never an infinite re-prompt.
           try {
-            decision = await decideNextAction(snap, allowed, { workspaceId: snap.lead?.workspaceId, campaignId: ids.campaignId, leadId: ids.leadId, runId: run?.id }, String(e));
+            const { withToolTimeout } = await import("@/lib/tool-timeout");
+            decision = await withToolTimeout("decideNextAction", () =>
+              decideNextAction(snap, allowed, { workspaceId: snap.lead?.workspaceId, campaignId: ids.campaignId, leadId: ids.leadId, runId: run?.id }, String(e)));
           } catch (e2) {
             await finishRun(run?.id ?? null, t0, "needs_review", { termination: "invalid-decision", iterations: iter - 1 }, String(e2));
             throw e2 instanceof DecisionError ? e2 : new DecisionError(String(e2));
@@ -883,7 +922,8 @@ export async function runAgent(
       }
       const callT0 = Date.now();
       try {
-        const result = await tools[toolName]!.fn(args, ids);
+        const { withToolTimeout } = await import("@/lib/tool-timeout");
+        const result = await withToolTimeout(toolName, () => tools[toolName]!.fn(args, ids));
         lastOutput = result;
         consecutiveErrors = 0;
         history.push({ tool: toolName, ok: true, summary: summarizeResult(result) });
@@ -989,13 +1029,18 @@ async function runAgentWithHistory(
       const snap = await buildSnapshot(type, ids, history, iter);
       let decision: ToolChoice;
       try {
-        decision = opts?.decide
-          ? await opts.decide(snap, allowed)
-          : await decideNextAction(snap, allowed, { campaignId: ids.campaignId, leadId: ids.leadId, runId });
+        const { withToolTimeout } = await import("@/lib/tool-timeout");
+        const decide =
+          opts?.decide ??
+          ((s: StateSnapshot, a: string[]) =>
+            decideNextAction(s, a, { campaignId: ids.campaignId, leadId: ids.leadId, runId }));
+        decision = await withToolTimeout("decideNextAction", () => decide(snap, allowed));
       } catch (e) {
         if (e instanceof DecisionError && !opts?.decide) {
           try {
-            decision = await decideNextAction(snap, allowed, { campaignId: ids.campaignId, leadId: ids.leadId, runId }, String(e));
+            const { withToolTimeout } = await import("@/lib/tool-timeout");
+            decision = await withToolTimeout("decideNextAction", () =>
+              decideNextAction(snap, allowed, { campaignId: ids.campaignId, leadId: ids.leadId, runId }, String(e)));
           } catch (e2) {
             await finishRun(runId, t0, "needs_review", { termination: "invalid-decision", resumed: true }, String(e2));
             throw e2 instanceof DecisionError ? e2 : new DecisionError(String(e2));
@@ -1040,7 +1085,8 @@ async function runAgentWithHistory(
       ctx.toolCalls++;
       const callT0 = Date.now();
       try {
-        const result = await tools[toolName]!.fn(args, ids);
+        const { withToolTimeout } = await import("@/lib/tool-timeout");
+        const result = await withToolTimeout(toolName, () => tools[toolName]!.fn(args, ids));
         lastOutput = result;
         consecutiveErrors = 0;
         const entry: HistoryEntry = { tool: toolName, ok: true, summary: summarizeResult(result) };

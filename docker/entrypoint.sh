@@ -40,6 +40,12 @@ fi
 if [ "$MODE" = "app" ]; then
   gen_secret_if_placeholder AUTH_SECRET
   gen_secret_if_placeholder ENCRYPTION_KEY
+  # Webhook receivers need a secret to trust; generate an ephemeral one for
+  # local dev so `docker compose up` works with zero configuration.
+  if [ -z "${EMAIL_WEBHOOK_SECRET:-}" ]; then
+    export EMAIL_WEBHOOK_SECRET=$(node -e "console.log(require('crypto').randomBytes(32).toString('hex'))")
+    echo "[entrypoint] WARNING: generated ephemeral EMAIL_WEBHOOK_SECRET (set a real value in .env for anything shared)"
+  fi
   echo "[entrypoint] applying database migrations..."
   npx prisma migrate deploy
   if [ "${SEED_ON_BOOT:-true}" = "true" ]; then

@@ -61,7 +61,13 @@ export async function respondToProspect(leadId: string, prospectMessage: string)
     await db.suppression.create({
       data: { workspaceId: lead.workspaceId, email: lead.contact?.email?.toLowerCase(), reason: "unsubscribed" },
     }).catch(() => undefined);
-    await db.lead.update({ where: { id: leadId }, data: { status: "UNSUBSCRIBED" } }).catch(() => undefined);
+    const { setLeadStatus } = await import("./state-machine");
+    try {
+      await setLeadStatus(leadId, "UNSUBSCRIBED", { intent });
+    } catch (e) {
+      // Terminal states (e.g. already DISQUALIFIED) stay as-is; suppression above still holds.
+      if (!String(e).startsWith("Illegal transition")) throw e;
+    }
     const reply = `Understood — I've removed you from this sequence. You won't hear from us again.`;
     await db.conversationMessage.create({ data: { conversationId: convo.id, role: "agent", body: reply, intent } });
     return { reply, intent, confidence, knowledgeUsed: [], handoff: false, approvalRequired: false };

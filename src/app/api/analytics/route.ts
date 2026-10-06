@@ -28,6 +28,22 @@ async function getHandler(req: Request) {
     const leadIds = campaignId
       ? undefined
       : (await db.lead.findMany({ where: { campaignId: { in: campaignIds ?? [] } }, select: { id: true } })).map((l) => l.id);
+    // Lead-source funnel: source → qualified → contacted → replied → meeting.
+    const funnelRows = await db.lead.groupBy({
+      by: ["source", "status"],
+      where: campFilter,
+      _count: { _all: true },
+    }).catch(() => []);
+    const funnel: Record<string, { total: number; qualified: number; contacted: number; replied: number; meetings: number }> = {};
+    for (const r of funnelRows) {
+      const src = r.source ?? "unknown";
+      funnel[src] ??= { total: 0, qualified: 0, contacted: 0, replied: 0, meetings: 0 };
+      funnel[src]!.total += r._count._all;
+      if (["QUALIFIED", "READY_FOR_OUTREACH", "CONTACTED", "FOLLOW_UP", "REPLIED", "QUALIFIED_REPLY", "MEETING_REQUESTED", "MEETING_BOOKED"].includes(r.status)) funnel[src]!.qualified += r._count._all;
+      if (["CONTACTED", "FOLLOW_UP", "REPLIED", "QUALIFIED_REPLY", "MEETING_REQUESTED", "MEETING_BOOKED"].includes(r.status)) funnel[src]!.contacted += r._count._all;
+      if (["REPLIED", "QUALIFIED_REPLY", "MEETING_REQUESTED", "MEETING_BOOKED"].includes(r.status)) funnel[src]!.replied += r._count._all;
+      if (r.status === "MEETING_BOOKED") funnel[src]!.meetings += r._count._all;
+    }
     const [
       prospects, qualified, sent, delivered, bounced, failed,
       replies, positive, negative, meetings, completions, stops, optouts,
@@ -54,6 +70,12 @@ async function getHandler(req: Request) {
       db.llmUsage.aggregate({ where: campaignId ? { campaignId } : { workspaceId: wsFilter }, _sum: { costUsd: true } }),
       db.researchCache.aggregate({ where: campaignId ? {} : { workspaceId: wsFilter }, _sum: { hits: true } }),
     ]);
+    // Operational warnings (not vanity metrics): surface unsafe/failing states.
+    const warnings: string[] = [];
+    if (sent > 0 && bounced / sent >= 0.05) warnings.push(`bounce rate ${(bounced / sent * 100).toFixed(1)}% ≥ 5% — pause sending and clean the list`);
+    if (failed > 0) warnings.push(`${failed} failed send(s) — check provider credentials and dead letters`);
+    if (optouts > 0 && sent > 0 && optouts / sent >= 0.02) warnings.push(`opt-out rate ${(optouts / sent * 100).toFixed(1)}% ≥ 2% — review messaging and targeting`);
+    if (prospects > 0 && qualified === 0) warnings.push("no qualified leads — review ICP fit or scoring weights");
     return NextResponse.json({
       prospectsDiscovered: prospects, prospectsQualified: qualified,
       emailsSent: sent, delivered, bounced, failedSends: failed,
@@ -62,6 +84,8 @@ async function getHandler(req: Request) {
       optOuts: optouts, aiRuns: runs, llmCalls,
       tokens: tokens._sum.totalTokens ?? 0, estimatedCostUsd: cost._sum.costUsd ?? 0,
       researchCacheHits: cacheHits._sum.hits ?? 0,
+      sourceBreakdown: funnel,
+      warnings,
     });
   } catch {
     return NextResponse.json({ offline: true });

@@ -178,6 +178,13 @@ All settings live in `.env` (see `.env.example` for the full annotated list): da
 
 Set `LLM_PROVIDER` to one of `openai|anthropic|deepseek|openrouter`. Per-task model routing is configured in the `model_configs` database table (provider + model + priority), so different workspaces or tasks can use different providers without code changes. OpenRouter routes to underlying models — the model ID you configure is passed through to OpenRouter's gateway.
 
+### Production operations
+
+- **Per-client deploys:** `./deploy-client.sh <client>` provisions an isolated stack (own Compose project, env file, ports), validates config, migrates, seeds, and health-checks every service. See `docs/deployment.md`.
+- **Deliverability preflight:** `POST /api/admin/deliverability` checks SPF/DKIM/DMARC, provider credentials, webhook secret, suppression, limits, and bounce rate, returning `PASS`/`WARNING`/`FAIL`. A `FAIL` verdict automatically downgrades autonomous auto-approval to human review.
+- **Integration checks:** `GET /api/admin/integrations?workspaceId=` runs non-destructive credential probes (email, prospecting, CRM, calendar) and reports `pass`/`fail`/`not_configured` without exposing secrets. The `/onboarding` wizard walks a new client through workspace → integrations → knowledge → campaign → preflight.
+- **Knowledge retrieval** is hybrid (keyword + pgvector cosine, workspace-isolated) with automatic embedding on ingest and `npx tsx scripts/backfill-embeddings.ts [workspaceId]` for older documents.
+
 ## Project layout
 
 | Path | What lives there |

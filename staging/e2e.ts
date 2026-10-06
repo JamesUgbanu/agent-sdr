@@ -129,8 +129,24 @@ const dupResult = (await tools.sendEmail!.fn({ messageId: msg0!.id }, {})) as { 
 check("duplicate send blocked", dupResult.skipped === true);
 
 // ── 8. inbound reply webhook → classification → auto-stop (via HTTP + worker) ──
+// Uses the deployment's webhook secret when one is configured (the Docker
+// entrypoint generates an ephemeral one, visible to in-container processes via
+// the app server's environment). Local runs without a secret stay open.
+import { readFileSync } from "node:fs";
+function webhookSecret(): string {
+  if (process.env.EMAIL_WEBHOOK_SECRET) return process.env.EMAIL_WEBHOOK_SECRET;
+  try {
+    const env = readFileSync("/proc/1/environ", "utf8").split("\0");
+    const hit = env.find((e) => e.startsWith("EMAIL_WEBHOOK_SECRET="));
+    const val = hit?.slice("EMAIL_WEBHOOK_SECRET=".length);
+    if (val) return val;
+  } catch { /* not in a container — fall through to open mode */ }
+  return "";
+}
+const whSecret = webhookSecret();
 const inboundRes = await fetch(`${BASE}/api/webhooks/email`, {
-  method: "POST", headers: { "Content-Type": "application/json" },
+  method: "POST",
+  headers: { "Content-Type": "application/json", ...(whSecret ? { "x-webhook-secret": whSecret } : {}) },
   body: JSON.stringify({ from: `qa-${tag}@example.com`, subject: "Re: idea", body: "This looks interesting, tell me more!", providerMessageId: `qa-pmid-${tag}` }),
 });
 check("webhook accepted", inboundRes.ok, String(inboundRes.status));

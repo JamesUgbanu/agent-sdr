@@ -1,7 +1,9 @@
 node_modules
 .next
 .env
-.env*.local
+# Per-client env files (deploy-client.sh) must never be committed.
+.env.*
+!.env.example
 *.db
 dist
 tsconfig.tsbuildinfo

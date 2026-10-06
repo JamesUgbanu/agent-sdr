@@ -426,7 +426,12 @@ export async function handleMeetingRequest(leadId: string) {
         idempotencyKey: `${leadId}-meeting-offer-${Date.now()}`,
       },
     });
-    await db.lead.update({ where: { id: leadId }, data: { status: "MEETING_REQUESTED" } });
+    const { setLeadStatus } = await import("./state-machine");
+    try {
+      await setLeadStatus(leadId, "MEETING_REQUESTED", { source: "slots-offered" });
+    } catch {
+      /* lead already past this point (e.g. MEETING_BOOKED) — keep state */
+    }
     await db.agentEvent.create({ data: { leadId, campaignId: lead.campaignId, kind: "meeting.slots_offered", message: `${slots.length} real slots offered`, payload: J({ slots }) } }).catch(() => undefined);
   }
 }
@@ -451,7 +456,8 @@ export async function bookMeeting(input: {
     start: input.start, end: input.end, attendee: lead.contact.email,
     timezone: input.timezone ?? lead.campaign.timezone ?? "UTC", leadId: lead.id,
   });
-  await db.lead.update({ where: { id: lead.id }, data: { status: "MEETING_BOOKED" } }).catch(() => undefined);
+  const { setLeadStatus } = await import("./state-machine");
+  await setLeadStatus(lead.id, "MEETING_BOOKED", { start: input.start });
   await db.leadSequenceState.update({ where: { leadId: lead.id }, data: { stoppedReason: "meeting-booked" } }).catch(() => undefined);
   await updateCRM(lead.id, "create_activity", { type: "note", body: `Meeting booked: ${input.start}` }).catch(() => undefined);
   return { id };

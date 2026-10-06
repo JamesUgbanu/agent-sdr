@@ -15,14 +15,12 @@ const EventSchema = z.object({
 });
 
 async function postHandler(req: Request) {
-  const { safeEqual } = await import("@/lib/crypto");
-  const secret = req.headers.get("x-webhook-secret");
-  if (process.env.EMAIL_WEBHOOK_SECRET && !safeEqual(secret, process.env.EMAIL_WEBHOOK_SECRET)) {
-    return NextResponse.json({ error: "unauthorized" }, { status: 401 });
-  }
-  const claimed = Number(req.headers.get("content-length") ?? 0);
-  if (claimed > 262_144) return NextResponse.json({ error: "payload too large" }, { status: 413 });
-  const body = EventSchema.parse(await req.json());
+  const { webhookAuthSvix } = await import("@/lib/webhook-auth");
+  const rawBody = await req.text();
+  await webhookAuthSvix(req, "email-events", "RESEND_WEBHOOK_SECRET", rawBody);
+  const claimed = Number(req.headers.get("content-length") ?? rawBody.length);
+  if (claimed > 262_144 || rawBody.length > 262_144) return NextResponse.json({ error: "payload too large" }, { status: 413 });
+  const body = EventSchema.parse(JSON.parse(rawBody));
   const msg = await db.message.findUnique({
     where: { providerMessageId: body.providerMessageId },
     include: { thread: { include: { lead: true } } },
@@ -39,7 +37,13 @@ async function postHandler(req: Request) {
   const leadId = msg.thread.leadId;
   if (body.event === "bounced" || body.event === "complained") {
     await db.message.update({ where: { id: msg.id }, data: { status: "bounced", error: body.error } });
-    await db.lead.update({ where: { id: leadId }, data: { status: "BOUNCED" } }).catch(() => undefined);
+    // Bounce only regresses pre-reply states: a bounced follow-up arriving
+    // after the prospect already replied must not overwrite the reply.
+    const current = await db.lead.findUnique({ where: { id: leadId }, select: { status: true } }).catch(() => null);
+    if (current && ["READY_FOR_OUTREACH", "CONTACTED", "FOLLOW_UP"].includes(current.status)) {
+      const { setLeadStatus } = await import("@/lib/state-machine");
+      await setLeadStatus(leadId, "BOUNCED", { event: body.event }).catch(() => undefined);
+    }
     await db.leadSequenceState.update({ where: { leadId }, data: { stoppedReason: "bounced" } }).catch(() => undefined);
     const email = msg.thread.lead.contactId
       ? (await db.contact.findUnique({ where: { id: msg.thread.lead.contactId } }).catch(() => null))?.email
@@ -49,6 +53,8 @@ async function postHandler(req: Request) {
         data: { workspaceId: msg.thread.lead.workspaceId, email: email.toLowerCase(), reason: "bounced" },
       }).catch(() => undefined);
     }
+    const { evaluateOperationalAlerts } = await import("@/lib/deliverability");
+    await evaluateOperationalAlerts({ workspaceId: msg.thread.lead.workspaceId, leadId, trigger: body.event === "complained" ? "complaint" : "bounce" });
   } else if (body.event === "delivered") {
     if (msg.status === "sent") await db.message.update({ where: { id: msg.id }, data: { status: "delivered" } });
   }

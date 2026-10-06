@@ -30,6 +30,7 @@ COPY --from=builder /app/workers ./workers
 COPY --from=builder /app/eval ./eval
 COPY --from=builder /app/tests ./tests
 COPY --from=builder /app/staging ./staging
+COPY --from=builder /app/scripts ./scripts
 COPY package.json next.config.mjs middleware.ts instrumentation.ts tsconfig.json vitest.config.ts ./
 COPY docker ./docker
 RUN chmod +x /app/docker/entrypoint.sh
