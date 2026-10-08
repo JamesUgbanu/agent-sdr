@@ -19,7 +19,8 @@ vi.mock("../src/lib/llm", () => ({
   }),
 }));
 
-import { decideNextAction, fallbackDecide, DecisionError } from "../src/server/agents/orchestrator";
+import { decideNextAction, fallbackDecide, DecisionError, isRepeatedCall } from "../src/server/agents/orchestrator";
+import type { HistoryEntry } from "../src/server/agents/orchestrator";
 import type { StateSnapshot } from "../src/server/agents/orchestrator";
 
 function snap(over: Partial<StateSnapshot> = {}): StateSnapshot {
@@ -112,5 +113,50 @@ describe("tool-schema helpers", () => {
   });
   it("stableArgs is order-insensitive", () => {
     expect(stableArgs({ b: 1, a: 2 })).toBe(stableArgs({ a: 2, b: 1 }));
+  });
+});
+
+describe("isRepeatedCall", () => {
+  const withRaw = (tool: string, ok: boolean, args: unknown) =>
+    ({ tool, ok, summary: "{}", rawArgs: JSON.stringify(args) }) as unknown as HistoryEntry;
+  it("allows the first and second identical successes", async () => {
+    expect(isRepeatedCall([], "scoreLead", { leadId: "l1" })).toBe(false);
+    expect(isRepeatedCall([withRaw("scoreLead", true, { leadId: "l1" })], "scoreLead", { leadId: "l1" })).toBe(false);
+  });
+  it("blocks the third identical success (MAX_IDENTICAL_CALLS = 3)", async () => {
+    const h = [withRaw("scoreLead", true, { leadId: "l1" }), withRaw("scoreLead", true, { leadId: "l1" })];
+    expect(isRepeatedCall(h, "scoreLead", { leadId: "l1" })).toBe(true);
+  });
+  it("ignores other tools, other args, failures, and missing rawArgs", async () => {
+    const h = [
+      withRaw("scoreLead", true, { leadId: "l1" }),
+      withRaw("scoreLead", true, { leadId: "l1" }),
+      withRaw("researchCompany", true, { leadId: "l1" }),
+      withRaw("scoreLead", true, { leadId: "other" }),
+      withRaw("scoreLead", false, { leadId: "l1" }),
+      { tool: "scoreLead", ok: true, summary: "{}" },
+    ];
+    expect(isRepeatedCall(h, "scoreLead", { leadId: "l1" })).toBe(true); // the two identical ok entries still trip it
+    expect(isRepeatedCall(h, "researchCompany", { leadId: "l1" })).toBe(false);
+    expect(isRepeatedCall(h, "scoreLead", { leadId: "other" })).toBe(false);
+    expect(isRepeatedCall([withRaw("scoreLead", false, { leadId: "l1" }), withRaw("scoreLead", false, { leadId: "l1" })], "scoreLead", { leadId: "l1" })).toBe(false);
+  });
+  it("normalizes key order before comparing", async () => {
+    const h = [
+      { tool: "t", ok: true, summary: "{}", rawArgs: '{"b":1,"a":2}' },
+      { tool: "t", ok: true, summary: "{}", rawArgs: '{"b":1,"a":2}' },
+    ] as unknown as HistoryEntry[];
+    expect(isRepeatedCall(h, "t", { a: 2, b: 1 })).toBe(true);
+  });
+});
+
+describe("checkBudgets", () => {
+  it("throws on steps, tool-calls, and runtime exhaustion; passes otherwise", async () => {
+    const { checkBudgets, BudgetError } = await import("../src/lib/budgets");
+    const base = { campaignId: "c", leadId: "l", correlationId: "x", startedAt: Date.now(), steps: 0, toolCalls: 0 };
+    expect(() => checkBudgets(base)).not.toThrow();
+    expect(() => checkBudgets({ ...base, steps: 20 })).toThrow(BudgetError);
+    expect(() => checkBudgets({ ...base, toolCalls: 30 })).toThrow(BudgetError);
+    expect(() => checkBudgets({ ...base, startedAt: Date.now() - 400_000 })).toThrow(BudgetError);
   });
 });

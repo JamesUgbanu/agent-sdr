@@ -90,14 +90,18 @@ export async function trackUsage(u: UsageRecord): Promise<void> {
         },
       }).catch(() => undefined);
     }
-    if (total != null) {
-      await db.usageEvent.create({
-        data: {
-          workspaceId: u.workspaceId, campaignId: u.campaignId, leadId: u.leadId,
-          kind: "llm_tokens", quantity: total, costUsd: cost ?? 0,
-          meta: J({ model: u.model, task: u.task, estimated }),
-        },
-      }).catch(() => undefined);
+      if (total != null) {
+        await db.usageEvent.create({
+          data: {
+            workspaceId: u.workspaceId, campaignId: u.campaignId, leadId: u.leadId,
+            kind: "llm_tokens", quantity: total, costUsd: cost ?? 0,
+            meta: J({ model: u.model, task: u.task, estimated }),
+          },
+        }).catch(() => undefined);
+      }
+    } catch (e) {
+      // Observability must never break the agent path — but a lost usage row
+      // silently skews cost/analytics, so warn with identifiers only.
+      console.warn(`[agent] usage persist failed (run ${u.runId ?? "n/a"}, task ${u.task}): ${String(e).slice(0, 200)}`);
     }
-  } catch { /* observability must never break the agent path */ }
 }
